@@ -14,6 +14,26 @@ load_toc_once <- local({
   }
 })
 
+fetch_sdmx_csv <- function(url, max_lines = Inf) {
+  # Download to temp file (more robust than readLines(url))
+  tf <- tempfile(fileext = ".csv")
+  utils::download.file(url, tf, quiet = TRUE, mode = "wb")
+  
+  # Read header + limited rows (line-based limiting)
+  con <- file(tf, open = "r", encoding = "UTF-8")
+  on.exit(close(con), add = TRUE)
+  
+  lines <- readLines(con, n = max_lines)
+  lines
+}
+
+parse_csv_lines <- function(lines) {
+  tf <- tempfile(fileext = ".csv")
+  writeLines(lines, tf, useBytes = TRUE)
+  utils::read.csv(tf, stringsAsFactors = FALSE, check.names = FALSE)
+}
+
+
 ui <- fluidPage(
   titlePanel("Eurostat Dataset Explorer (restatapi)"),
   sidebarLayout(
@@ -48,6 +68,11 @@ ui <- fluidPage(
       uiOutput("query_builder_ui"),
       textInput("txt_final_url", "Final SDMX Data URL:", "", width = "100%"),
       actionButton("btn_copy_query", "Copy query to clipboard"),
+      hr(),
+      h4("Data"),
+      actionButton("btn_preview_data", "Preview (first 200 rows)"),
+      downloadButton("btn_download_data", "Download SDMX-CSV"),
+      
       tags$script(HTML("
         Shiny.addCustomMessageHandler('copyToClipboard', function(message) {
           var text = message.text || '';
@@ -93,7 +118,11 @@ ui <- fluidPage(
       h4("Dataset Structure: Dimensions"),
       uiOutput("dim_selection_ui"),
       DTOutput("tbl_codes"),
-      uiOutput("message_ui")
+      uiOutput("message_ui"),
+      hr(),
+      uiOutput("preview_ui"),
+      verbatimTextOutput("txt_data_status")
+      
     )
   )
 )
@@ -232,6 +261,15 @@ server <- function(input, output, session) {
     rv$time_to <- NULL
     rv$base_url <- NULL
     rv$final_url <- NULL
+  
+    # --- Clear preview state (this is the one actually used) ---
+    preview_df(NULL)
+    output$txt_data_status <- renderText("")
+    
+    # --- Force-clear the DT widget if it exists (removes “stale” table in UI) ---
+    proxy <- DT::dataTableProxy("tbl_preview")
+    DT::replaceData(proxy, data.frame(), resetPaging = TRUE)
+    DT::clearSearch(proxy)
     
     # Clear UI inputs
     updateTextInput(session, "search", value = "")
@@ -269,6 +307,7 @@ server <- function(input, output, session) {
       rv$time_to <- NULL
       rv$base_url <- NULL
       rv$final_url <- NULL
+      rv$preview_df <- NULL
       updateTextInput(session, "txt_final_url", value = "")
     } else {
       rv$dataset_id <- NULL
@@ -279,6 +318,7 @@ server <- function(input, output, session) {
       rv$time_to <- NULL
       rv$base_url <- NULL
       rv$final_url <- NULL
+      rv$preview_df <- NULL
       updateTextInput(session, "txt_final_url", value = "")
     }
   })
@@ -318,6 +358,7 @@ server <- function(input, output, session) {
       rv$time_to <- NULL
       rv$base_url <- NULL
       rv$final_url <- NULL
+      rv$preview_df <- NULL
       updateTextInput(session, "txt_final_url", value = "")
       
       showNotification("DSD loaded.", type = "message")
@@ -331,6 +372,7 @@ server <- function(input, output, session) {
       rv$time_to <- NULL
       rv$base_url <- NULL
       rv$final_url <- NULL
+      rv$preview_df <- NULL
       updateTextInput(session, "txt_final_url", value = "")
     })
   })
@@ -583,6 +625,100 @@ server <- function(input, output, session) {
     
     showNotification("Copied (or attempted). If it failed, click in the URL field and press Ctrl+C.", type = "message")
   })
+  
+  preview_df <- reactiveVal(NULL)
+  
+  observeEvent(input$btn_preview_data, {
+    req(rv$final_url)
+    
+    # Safety: ensure SDMX-CSV
+    url <- rv$final_url
+    if (!grepl("format=SDMX-CSV", url, fixed = TRUE)) {
+      showNotification("Final URL must include format=SDMX-CSV.", type = "error")
+      return()
+    }
+    
+    output$txt_data_status <- renderText("Fetching preview…")
+    
+    tryCatch({
+      withProgress(message = "Downloading preview…", value = 0, {
+        incProgress(0.3, detail = "Requesting SDMX-CSV…")
+        lines <- fetch_sdmx_csv(url, max_lines = 250)  # header + ~250 lines
+        incProgress(0.7, detail = "Parsing…")
+        df <- parse_csv_lines(lines)
+        incProgress(1, detail = "Done")
+        preview_df(df)
+      })
+      output$txt_data_status <- renderText(sprintf("Preview loaded: %d rows, %d columns", nrow(preview_df()), ncol(preview_df())))
+    }, error = function(e) {
+      preview_df(NULL)
+      output$txt_data_status <- renderText(paste("Preview failed:", e$message))
+      showNotification(paste0("Preview failed: ", e$message), type = "error")
+    })
+  })
+  
+  output$preview_ui <- renderUI({
+    df <- preview_df()
+    if (is.null(df)) return(NULL)
+    
+    tagList(
+      h4("Data Preview"),
+      DTOutput("tbl_preview")
+    )
+  })
+  
+  output$tbl_preview <- renderDT({
+    df <- preview_df()
+    req(df)
+    datatable(df, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE)
+  }, server = TRUE)
+  
+  # output$preview_ui <- renderUI({
+  #   if (is.null(rv$preview_df)) {
+  #     return(NULL)
+  #   }
+  #   tagList(
+  #     h4("Data Preview"),
+  #     DTOutput("tbl_preview")
+  #   )
+  # })
+  # 
+  # output$tbl_preview <- renderDT({
+  #   req(rv$preview_df)
+  #   datatable(rv$preview_df,
+  #             options = list(pageLength = 10, scrollX = TRUE),
+  #             rownames = FALSE)
+  # }, server = TRUE)
+  
+  # output$tbl_preview <- renderDT({
+  #   df <- preview_df()
+  #   if (is.null(df)) {
+  #     return(datatable(data.frame(Message = "No preview loaded yet."), options = list(dom = "t"), rownames = FALSE))
+  #   }
+  #   datatable(df, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE)
+  # }, server = TRUE)
+  
+
+  
+  output$btn_download_data <- downloadHandler(
+    filename = function() {
+      id <- if (!is.null(rv$dataset_id)) rv$dataset_id else "eurostat"
+      paste0(id, "_sdmx.csv")
+    },
+    content = function(file) {
+      req(rv$final_url)
+      url <- rv$final_url
+      if (!grepl("format=SDMX-CSV", url, fixed = TRUE)) {
+        stop("Final URL must include format=SDMX-CSV.")
+      }
+      # Direct download to the provided file path
+      utils::download.file(url, file, quiet = TRUE, mode = "wb")
+    }
+  )
+  
+  observe({ cat("rv$preview_df is NULL? ", is.null(rv$preview_df), "\n") })
+  observe({ cat("preview_df() is NULL? ", is.null(preview_df()), "\n") })
+  
   
 }
 
