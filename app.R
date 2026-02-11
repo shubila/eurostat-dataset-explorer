@@ -19,7 +19,16 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       textInput("search", "Search Datasets by keyword:", value = ""),
-      actionButton("btn_search", "Search"),
+      fluidRow(
+        column(
+          width = 6,
+          actionButton("btn_search", "Search", width = "100%")
+        ),
+        column(
+          width = 6,
+          actionButton("btn_clear_all", "Reset", width = "100%", class = "btn-warning")
+        )
+      ),
       tags$div(
         style = "margin-top: 6px; color: #666; font-size: 0.85em;",
         "Search tips: ",
@@ -41,13 +50,40 @@ ui <- fluidPage(
       actionButton("btn_copy_query", "Copy query to clipboard"),
       tags$script(HTML("
         Shiny.addCustomMessageHandler('copyToClipboard', function(message) {
-          navigator.clipboard.writeText(message).then(function() {
-            alert('Query URL copied to clipboard');
-          }, function(err) {
-            alert('Failed to copy: ' + err);
-          });
+          var text = message.text || '';
+          var inputId = message.inputId || 'txt_final_url';
+        
+          function fallbackCopy() {
+            var el = document.getElementById(inputId);
+            if (!el) { alert('Copy failed: input not found'); return; }
+            el.focus();
+            el.select();
+            try {
+              var ok = document.execCommand('copy');
+              if (ok) {
+                if (message.notifyId) Shiny.setInputValue(message.notifyId, 'Copied!', {priority: 'event'});
+                else alert('Copied to clipboard');
+              } else {
+                alert('Copy failed (execCommand returned false).');
+              }
+            } catch (e) {
+              alert('Copy failed: ' + e);
+            }
+          }
+        
+          // Try modern Clipboard API first
+          if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text).then(function() {
+              if (message.notifyId) Shiny.setInputValue(message.notifyId, 'Copied!', {priority: 'event'});
+              else alert('Copied to clipboard');
+            }).catch(function() {
+              fallbackCopy();
+            });
+          } else {
+            fallbackCopy();
+          }
         });
-      "))
+        "))
     ),
     
     mainPanel(
@@ -127,6 +163,68 @@ server <- function(input, output, session) {
     base_url = NULL,
     final_url = NULL
   )
+  
+  # observeEvent(input$btn_clear_all, {
+  #   # If DSD exists, clear filters first (so inputs exist)
+  #   if (!is.null(rv$dsd)) {
+  #     dims <- unique(rv$dsd$concept)
+  #     for (d in dims) {
+  #       id <- paste0("filter_", d)
+  #       if (!is.null(input[[id]])) {
+  #         updateSelectizeInput(session, id, selected = character(0), server = TRUE)
+  #       }
+  #     }
+  #   }
+  #   
+  #   # Now reset everything
+  #   rv$dataset_id <- NULL
+  #   rv$dsd <- NULL
+  #   rv$dim_selected <- NULL
+  #   rv$dim_filters <- NULL
+  #   rv$time_from <- NULL
+  #   rv$time_to <- NULL
+  #   rv$base_url <- NULL
+  #   rv$final_url <- NULL
+  #   
+  #   updateTextInput(session, "search", value = "")
+  #   updateTextInput(session, "txt_final_url", value = "")
+  #   
+  #   showNotification("Cleared. Ready for a new search.", type = "message")
+  # })
+  observeEvent(input$btn_clear_all, {
+    # Reset reactive values
+    rv$dataset_id <- NULL
+    rv$dsd <- NULL
+    rv$dim_selected <- NULL
+    
+    # Query builder state
+    rv$dim_filters <- NULL
+    rv$time_from <- NULL
+    rv$time_to <- NULL
+    rv$base_url <- NULL
+    rv$final_url <- NULL
+    
+    # Clear UI inputs
+    updateTextInput(session, "search", value = "")
+    updateTextInput(session, "txt_final_url", value = "")
+    
+    # Clear dimension selector (it’s rendered via renderUI, so resetting rv$dim_selected is enough,
+    # but this does not hurt if it exists)
+    # updateSelectInput(session, "sel_dim", selected = character(0))
+    
+    # Clear filter inputs (they exist only when UI is rendered)
+    if (!is.null(rv$dsd)) {
+      dims <- unique(rv$dsd$concept)
+      for (d in dims) {
+        id <- paste0("filter_", d)
+        if (!is.null(input[[id]])) {
+          updateSelectizeInput(session, id, selected = character(0), server = TRUE)
+        }
+      }
+    }
+    
+    showNotification("Cleared. Ready for a new search.", type = "message")
+  })
   
   observeEvent(input$tbl_toc_rows_selected, {
     rows <- input$tbl_toc_rows_selected
@@ -353,12 +451,12 @@ server <- function(input, output, session) {
     req(rv$dataset_id)
     rv$base_url <- build_base_url()
     # Unfiltered query for SDMX-CSV format
-    base_url_w_format <- paste0(rv$base_url, "?format=CSV")
+    base_url_w_format <- paste0(rv$base_url, "?format=SDMX-CSV")
     rv$final_url <- base_url_w_format
     updateTextInput(session, "txt_final_url", value = rv$final_url)
   })
   
-  # Build full URL with filters and time, format=CSV default
+  # Build full URL with filters and time, format=SDMX-CSV default
   build_full_url <- reactive({
     req(rv$base_url)
     dims <- unique(rv$dsd$concept)
@@ -428,8 +526,8 @@ server <- function(input, output, session) {
     key_string <- paste(segments, collapse = ".")
     
     # Build final URL
-    # Format default to CSV to meet requirement
-    url <- paste0(rv$base_url, "/", key_string, "?format=CSV")
+    # Format default to SDMX-CSV to meet requirement
+    url <- paste0(rv$base_url, "/", key_string, "?format=SDMX-CSV")
     url
   })
   
