@@ -123,21 +123,50 @@ server <- function(input, output, session) {
     Reduce(`|`, group_hits)
   }
   # Dataset search logic
+  # search_results <- eventReactive(input$btn_search, {
+  #   req(toc())
+  #   df <- toc()
+  #   pattern <- trimws(input$search)
+  #   if (!nzchar(pattern)) return(data.frame())
+  #   haystack <- paste(df$code, df$title, sep = " | ")
+  #   hits <- match_query_groups(haystack, pattern, ignore.case = TRUE)
+  #   res <- df[hits, , drop = FALSE]
+  #   if (nrow(res) == 0) {
+  #     showNotification(
+  #       "No datasets found. Tip: space = AND, | = OR (grouped). Example: bop financial|iip",
+  #       type = "warning"
+  #     )
+  #   }
+  #   res
+  # })
   search_results <- eventReactive(input$btn_search, {
     req(toc())
     df <- toc()
+    
     pattern <- trimws(input$search)
     if (!nzchar(pattern)) return(data.frame())
-    haystack <- paste(df$code, df$title, sep = " | ")
-    hits <- match_query_groups(haystack, pattern, ignore.case = TRUE)
-    res <- df[hits, , drop = FALSE]
-    if (nrow(res) == 0) {
-      showNotification(
-        "No datasets found. Tip: space = AND, | = OR (grouped). Example: bop financial|iip",
-        type = "warning"
-      )
-    }
-    res
+    
+    withProgress(message = "Searching Eurostat TOC…", value = 0, {
+      incProgress(0.2, detail = "Preparing query…")
+      
+      haystack <- paste(df$code, df$title, sep = " | ")
+      incProgress(0.4, detail = "Matching titles…")
+      
+      hits <- match_query_groups(haystack, pattern, ignore.case = TRUE)
+      incProgress(0.8, detail = "Building results…")
+      
+      res <- df[hits, , drop = FALSE]
+      incProgress(1, detail = "Done")
+      
+      if (nrow(res) == 0) {
+        showNotification(
+          "No datasets found. Tip: space = AND, | = OR (grouped). Example: bop financial|iip",
+          type = "warning"
+        )
+      }
+      
+      res
+    })
   })
   
   output$tbl_toc <- renderDT({
@@ -540,10 +569,21 @@ server <- function(input, output, session) {
   })
   
   # Copy query to clipboard
+  # observeEvent(input$btn_copy_query, {
+  #   req(rv$final_url)
+  #   session$sendCustomMessage("copyToClipboard", rv$final_url)
+  # })
   observeEvent(input$btn_copy_query, {
     req(rv$final_url)
-    session$sendCustomMessage("copyToClipboard", rv$final_url)
+    
+    session$sendCustomMessage("copyToClipboard", list(
+      text = rv$final_url,
+      inputId = "txt_final_url"   # ID:t på textInput där URL:en står
+    ))
+    
+    showNotification("Copied (or attempted). If it failed, click in the URL field and press Ctrl+C.", type = "message")
   })
+  
 }
 
 shinyApp(ui, server)
