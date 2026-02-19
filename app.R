@@ -1,661 +1,1055 @@
+
+# ============================================================
+# 1) Packages + global options
+#    Purpose:
+#    - Load required packages (fail fast if missing)
+#    - Set global runtime options that affect HTTP calls / caching
+#    - Keep everything here "non-reactive" (no input/output)
+# ============================================================
+
+# ---- Packages ----
+# Core Shiny framework + widgets/tables
 library(shiny)
 library(DT)
+
+# Eurostat SDMX client (REST + cache handling)
 library(restatapi)
 
-# Helper: Load TOC once and cache in memory
-load_toc_once <- local({
-  toc <- NULL
-  function() {
-    if (is.null(toc)) {
-      # Use verbose=FALSE and cache=TRUE default
-      toc <<- get_eurostat_toc(cache = TRUE, verbose = FALSE)
-    }
-    toc
-  }
-})
+# ---- Global options ----
+# Increase timeout for Eurostat API calls (TOC/DSD/data can be slow).
+# This is a global R option affecting download.file(), httr, etc.
+options(timeout = 120)
 
-fetch_sdmx_csv <- function(url, max_lines = Inf) {
-  # Download to temp file (more robust than readLines(url))
-  tf <- tempfile(fileext = ".csv")
-  utils::download.file(url, tf, quiet = TRUE, mode = "wb")
-  
-  # Read header + limited rows (line-based limiting)
-  con <- file(tf, open = "r", encoding = "UTF-8")
-  on.exit(close(con), add = TRUE)
-  
-  lines <- readLines(con, n = max_lines)
-  lines
+# restatapi specific:
+# - Keep cores = 1 to avoid parallel issues on some systems/servers.
+# - Disable auto-cache updates to prevent long startup delays.
+options(restatapi_cores = 1)
+options(restatapi_update = FALSE)
+
+# (Optional) Recommended for reproducible printing / less noise
+# options(stringsAsFactors = FALSE)  # not needed in modern R, but harmless
+# options(scipen = 999)              # avoid scientific notation in prints/tables
+
+# ---- Optional maintenance utilities (manual use) ----
+# Clear restatapi cache if you suspect stale metadata (run manually, not in app)
+# clean_restatapi_cache(verbose = TRUE)
+
+# Load restatapi config explicitly (rarely needed; only if you want to override defaults)
+# load_cfg(parallel = FALSE, verbose = TRUE)
+
+# ---- App rule: time handling ----
+# IMPORTANT:
+# Time filtering is applied ONLY via startPeriod/endPeriod derived from the TOC (dataStart/dataEnd).
+# We do NOT infer latest periods from DSD time codes. If a time dimension exists in DSD, it is treated
+# like any other dimension filter (part of the SDMX key), but start/endPeriod always come from TOC.
+
+
+# ---- Load helpers ----
+# We load helper files in lexical order (00_, 10_, 20_...) to ensure dependencies
+# are defined before use.
+# ---- Load helpers ----
+helper_files <- sort(list.files("R", pattern = "\\.R$", full.names = TRUE))
+
+for (f in helper_files) {
+  tryCatch(
+    source(f, local = FALSE),
+    error = function(e) stop("Failed to source helper file: ", f, "\n", conditionMessage(e))
+  )
 }
 
-parse_csv_lines <- function(lines) {
-  tf <- tempfile(fileext = ".csv")
-  writeLines(lines, tf, useBytes = TRUE)
-  utils::read.csv(tf, stringsAsFactors = FALSE, check.names = FALSE)
-}
 
+# ============================================================
+# 3) UI
+#    Purpose:
+#    - Define layout and inputs/outputs only
+#    - No business logic here
+# ============================================================
 
 ui <- fluidPage(
+  tags$head(
+    tags$script(src = "clipboard.js")
+  ),
+  
   titlePanel("Eurostat Dataset Explorer (restatapi)"),
+  
   sidebarLayout(
+    
+    # ----------------------------
+    # Sidebar: controls / actions
+    # ----------------------------
     sidebarPanel(
-      textInput("search", "Search Datasets by keyword:", value = ""),
+      
+      # --- Dataset search ---
+      h4("Dataset search"),
+      textInput("search", "Search datasets by keyword:", value = ""),
+      
       fluidRow(
-        column(
-          width = 6,
-          actionButton("btn_search", "Search", width = "100%")
-        ),
-        column(
-          width = 6,
-          actionButton("btn_clear_all", "Reset", width = "100%", class = "btn-warning")
-        )
+        column(6, actionButton("btn_search", "Search", width = "100%")),
+        column(6, actionButton("btn_clear_all", "Reset", width = "100%", class = "btn-warning"))
       ),
+      
       tags$div(
         style = "margin-top: 6px; color: #666; font-size: 0.85em;",
         "Search tips: ",
-        tags$code("space = AND"),
-        ", ",
+        tags$code("space = AND"), ", ",
         tags$code("| = OR"),
         tags$br(),
         tags$span("Example: "),
         tags$code("bop financial|iip")
       ),
+      
       hr(),
+      
+      # --- Dataset selection status (rendered from server) ---
       uiOutput("selected_dataset_ui"),
       actionButton("btn_load_dsd", "Load Structure"),
-      hr(),
-      h4("SDMX 2.1 Query Builder"),
-      actionButton("btn_generate_base_query", "Generate base query"),
-      uiOutput("query_builder_ui"),
-      textInput("txt_final_url", "Final SDMX Data URL:", "", width = "100%"),
-      actionButton("btn_copy_query", "Copy query to clipboard"),
-      hr(),
-      h4("Data"),
-      actionButton("btn_preview_data", "Preview (first 200 rows)"),
-      downloadButton("btn_download_data", "Download SDMX-CSV"),
       
-      tags$script(HTML("
-        Shiny.addCustomMessageHandler('copyToClipboard', function(message) {
-          var text = message.text || '';
-          var inputId = message.inputId || 'txt_final_url';
-        
-          function fallbackCopy() {
-            var el = document.getElementById(inputId);
-            if (!el) { alert('Copy failed: input not found'); return; }
-            el.focus();
-            el.select();
-            try {
-              var ok = document.execCommand('copy');
-              if (ok) {
-                if (message.notifyId) Shiny.setInputValue(message.notifyId, 'Copied!', {priority: 'event'});
-                else alert('Copied to clipboard');
-              } else {
-                alert('Copy failed (execCommand returned false).');
-              }
-            } catch (e) {
-              alert('Copy failed: ' + e);
-            }
-          }
-        
-          // Try modern Clipboard API first
-          if (navigator.clipboard && window.isSecureContext) {
-            navigator.clipboard.writeText(text).then(function() {
-              if (message.notifyId) Shiny.setInputValue(message.notifyId, 'Copied!', {priority: 'event'});
-              else alert('Copied to clipboard');
-            }).catch(function() {
-              fallbackCopy();
-            });
-          } else {
-            fallbackCopy();
-          }
-        });
-        "))
+      hr(),
+      
+      # --- Filters ---
+      h4("Filters"),
+      uiOutput("filters_ui"),
+      
+      hr(),
+      
+      # --- Query builder ---
+      h4("SDMX 2.1 Query Builder"),
+      actionButton("btn_generate_query", "Generate query"),
+      uiOutput("query_builder_ui"),
+      
+      # --- Extraction estimate  ---
+      textInput("txt_final_url", "Final SDMX Data URL:", "", width = "100%"),
+      # --- Extraction estimate  ---
+      h4("Estimate"),
+      verbatimTextOutput("txt_estimate"),
+      
+      actionButton("btn_copy_query", "Copy query to clipboard"),
+      
+      hr(),
+      
+      # --- Data actions ---
+      h4("Data"),
+      actionButton("btn_preview_data", "Preview (first rows)"),
+      downloadButton("btn_download_data", "Download SDMX-CSV")
     ),
     
+    
+    # ----------------------------
+    # Main panel: results / tables
+    # ----------------------------
     mainPanel(
+      
+      # --- Search results ---
       h4("Search Results"),
       DTOutput("tbl_toc"),
+      
       hr(),
+      
+      # --- DSD exploration ---
       h4("Dataset Structure: Dimensions"),
+      uiOutput("dims_overview_ui"),
       uiOutput("dim_selection_ui"),
       DTOutput("tbl_codes"),
       uiOutput("message_ui"),
+
       hr(),
+      
+      # --- Preview area ---
       uiOutput("preview_ui"),
       verbatimTextOutput("txt_data_status")
-      
     )
   )
 )
+# ============================================================
+# 4) Server
+#    Purpose:
+#    - Reactive logic
+#    - Data flow management
+#    - API interaction
+# ============================================================
 
 server <- function(input, output, session) {
-  # Cache TOC once per session
-  toc <- reactive({
-    load_toc_once()
-  })
-  # ------------------------------------------------------------
-  match_query_groups <- function(text, query, ignore.case = TRUE) {
-    query <- trimws(query)
-    if (!nzchar(query)) return(rep(FALSE, length(text)))
-    query <- gsub("\\s*\\|\\s*", "|", query)
-    or_groups <- strsplit(query, "\\|")[[1]]
-    or_groups <- trimws(or_groups)
-    or_groups <- or_groups[nzchar(or_groups)]
-    if (length(or_groups) == 0) return(rep(FALSE, length(text)))
-    group_hits <- lapply(or_groups, function(g) {
-      terms <- strsplit(g, "\\s+")[[1]]
-      terms <- terms[nzchar(terms)]
-      if (length(terms) == 0) return(rep(FALSE, length(text)))
-      Reduce(`&`, lapply(terms, function(t) {
-        grepl(t, text, ignore.case = ignore.case)
-      }))
-    })
-    Reduce(`|`, group_hits)
-  }
-  # Dataset search logic
-  # search_results <- eventReactive(input$btn_search, {
-  #   req(toc())
-  #   df <- toc()
-  #   pattern <- trimws(input$search)
-  #   if (!nzchar(pattern)) return(data.frame())
-  #   haystack <- paste(df$code, df$title, sep = " | ")
-  #   hits <- match_query_groups(haystack, pattern, ignore.case = TRUE)
-  #   res <- df[hits, , drop = FALSE]
-  #   if (nrow(res) == 0) {
-  #     showNotification(
-  #       "No datasets found. Tip: space = AND, | = OR (grouped). Example: bop financial|iip",
-  #       type = "warning"
-  #     )
-  #   }
-  #   res
-  # })
-  search_results <- eventReactive(input$btn_search, {
-    req(toc())
-    df <- toc()
-    
-    pattern <- trimws(input$search)
-    if (!nzchar(pattern)) return(data.frame())
-    
-    withProgress(message = "Searching Eurostat TOC…", value = 0, {
-      incProgress(0.2, detail = "Preparing query…")
-      
-      haystack <- paste(df$code, df$title, sep = " | ")
-      incProgress(0.4, detail = "Matching titles…")
-      
-      hits <- match_query_groups(haystack, pattern, ignore.case = TRUE)
-      incProgress(0.8, detail = "Building results…")
-      
-      res <- df[hits, , drop = FALSE]
-      incProgress(1, detail = "Done")
-      
-      if (nrow(res) == 0) {
-        showNotification(
-          "No datasets found. Tip: space = AND, | = OR (grouped). Example: bop financial|iip",
-          type = "warning"
-        )
-      }
-      
-      res
-    })
-  })
   
-  output$tbl_toc <- renderDT({
-    df <- search_results()
-    if (is.null(df) || nrow(df) == 0) {
-      return(datatable(data.frame(Message = "No search results"), options = list(dom = 't'), rownames = FALSE))
-    }
-    datatable(df[, c("title", "code", "dataStart", "dataEnd", "shortDescription")],
-              selection = "single",
-              rownames = FALSE,
-              options = list(pageLength = 10, scrollX = TRUE),
-              colnames = c("Title", "Code", "Start", "End", "Description"))
-  }, server = TRUE)
+  # ----------------------------------------
+  # 4.1 Reactive state container
+  # ----------------------------------------
   
   rv <- reactiveValues(
-    dataset_id = NULL,
-    dsd = NULL,
-    dim_selected = NULL,
-    # For query building: dimension filters (named list code vectors)
-    dim_filters = NULL,
-    time_from = NULL,
-    time_to = NULL,
+    toc = NULL,              # Eurostat TOC
+    dataset_id = NULL,       # Selected dataset
+    toc_start = NULL,        # dataStart from TOC
+    toc_end = NULL,          # dataEnd from TOC
+    dsd = NULL,              # Dataset structure
+    dim_filters = list(),    # Dimension filters
     base_url = NULL,
     final_url = NULL
   )
   
-  # observeEvent(input$btn_clear_all, {
-  #   # If DSD exists, clear filters first (so inputs exist)
-  #   if (!is.null(rv$dsd)) {
-  #     dims <- unique(rv$dsd$concept)
-  #     for (d in dims) {
-  #       id <- paste0("filter_", d)
-  #       if (!is.null(input[[id]])) {
-  #         updateSelectizeInput(session, id, selected = character(0), server = TRUE)
-  #       }
-  #     }
-  #   }
-  #   
-  #   # Now reset everything
-  #   rv$dataset_id <- NULL
-  #   rv$dsd <- NULL
-  #   rv$dim_selected <- NULL
-  #   rv$dim_filters <- NULL
-  #   rv$time_from <- NULL
-  #   rv$time_to <- NULL
-  #   rv$base_url <- NULL
-  #   rv$final_url <- NULL
-  #   
-  #   updateTextInput(session, "search", value = "")
-  #   updateTextInput(session, "txt_final_url", value = "")
-  #   
-  #   showNotification("Cleared. Ready for a new search.", type = "message")
-  # })
-  observeEvent(input$btn_clear_all, {
-    # Reset reactive values
-    rv$dataset_id <- NULL
-    rv$dsd <- NULL
-    rv$dim_selected <- NULL
-    
-    # Query builder state
-    rv$dim_filters <- NULL
-    rv$time_from <- NULL
-    rv$time_to <- NULL
-    rv$base_url <- NULL
-    rv$final_url <- NULL
+  search_df <- reactiveVal(data.frame())
+  preview_df <- reactiveVal(NULL)
   
-    # --- Clear preview state (this is the one actually used) ---
-    preview_df(NULL)
-    output$txt_data_status <- renderText("")
+  
+  
+  
+  # ----------------------------------------
+  # 4.2 Load TOC (once per session)
+  # ----------------------------------------
+  
+  observe({
+    if (!is.null(rv$toc)) return()
     
-    # --- Force-clear the DT widget if it exists (removes “stale” table in UI) ---
-    proxy <- DT::dataTableProxy("tbl_preview")
-    DT::replaceData(proxy, data.frame(), resetPaging = TRUE)
-    DT::clearSearch(proxy)
-    
-    # Clear UI inputs
-    updateTextInput(session, "search", value = "")
-    updateTextInput(session, "txt_final_url", value = "")
-    
-    # Clear dimension selector (it’s rendered via renderUI, so resetting rv$dim_selected is enough,
-    # but this does not hurt if it exists)
-    # updateSelectInput(session, "sel_dim", selected = character(0))
-    
-    # Clear filter inputs (they exist only when UI is rendered)
-    if (!is.null(rv$dsd)) {
-      dims <- unique(rv$dsd$concept)
-      for (d in dims) {
-        id <- paste0("filter_", d)
-        if (!is.null(input[[id]])) {
-          updateSelectizeInput(session, id, selected = character(0), server = TRUE)
-        }
-      }
-    }
-    
-    showNotification("Cleared. Ready for a new search.", type = "message")
+    withProgress(message = "Loading Eurostat catalogue (TOC)…", value = 0, {
+      incProgress(0.3, detail = "Reading cache / downloading…")
+      df <- load_toc_once()
+      incProgress(0.9, detail = "Finalizing…")
+      rv$toc <- df
+      incProgress(1)
+    })
   })
   
-  observeEvent(input$tbl_toc_rows_selected, {
-    rows <- input$tbl_toc_rows_selected
-    df <- search_results()
-    if (length(rows) == 1 && nrow(df) >= rows) {
-      rv$dataset_id <- df$code[rows]
-      rv$dsd <- NULL
-      rv$dim_selected <- NULL
-      
-      # Reset query builder facets on new dataset selection
-      rv$dim_filters <- NULL
-      rv$time_from <- NULL
-      rv$time_to <- NULL
-      rv$base_url <- NULL
-      rv$final_url <- NULL
-      rv$preview_df <- NULL
-      updateTextInput(session, "txt_final_url", value = "")
-    } else {
-      rv$dataset_id <- NULL
-      rv$dsd <- NULL
-      rv$dim_selected <- NULL
-      rv$dim_filters <- NULL
-      rv$time_from <- NULL
-      rv$time_to <- NULL
-      rv$base_url <- NULL
-      rv$final_url <- NULL
-      rv$preview_df <- NULL
-      updateTextInput(session, "txt_final_url", value = "")
-    }
-  })
   
-  output$selected_dataset_ui <- renderUI({
-    if (is.null(rv$dataset_id)) {
-      span(style = "color: red;", "No dataset selected")
-    } else {
-      tagList(
-        strong("Selected dataset ID:"), code(rv$dataset_id)
-      )
-    }
-  })
   
-  observeEvent(input$btn_load_dsd, {
-    if (is.null(rv$dataset_id)) {
-      showNotification("Please select a dataset before loading structure.", type = "error")
+  # ----------------------------------------
+  # 4.3 Search logic
+  # ----------------------------------------
+  
+  observeEvent(input$btn_search, {
+    req(rv$toc)
+    
+    pattern <- trimws(input$search)
+    if (!nzchar(pattern)) {
+      search_df(data.frame())
       return()
     }
     
-    tryCatch({
-      dsd_dt <- get_eurostat_dsd(rv$dataset_id, lang = "en")
-      needed <- c("concept", "code", "name")
-      if (!all(needed %in% names(dsd_dt)) || nrow(dsd_dt) == 0) {
-        showNotification("DSD loaded but has unexpected format (missing concept/code/name).", type = "warning")
-        rv$dsd <- NULL
-        rv$dim_selected <- NULL
+    haystack <- paste(rv$toc$code, rv$toc$title, sep = " | ")
+    hits <- match_query_groups(haystack, pattern, ignore.case = TRUE)
+    
+    search_df(rv$toc[hits, , drop = FALSE])
+  })
+  
+  
+  
+  
+  # ----------------------------------------
+  # 4.4 Render search results
+  # ----------------------------------------
+  
+  output$tbl_toc <- renderDT({
+    df <- search_df()
+    
+    if (is.null(df) || nrow(df) == 0) {
+      return(datatable(
+        data.frame(Message = "No search results"),
+        options = list(dom = "t"),
+        rownames = FALSE
+      ))
+    }
+    
+    datatable(
+      df[, c("title", "code", "dataStart", "dataEnd")],
+      selection = "single",
+      rownames = FALSE,
+      options = list(pageLength = 10, scrollX = TRUE),
+      colnames = c("Title", "Code", "Start", "End")
+    )
+  })
+  
+  
+  
+  # ----------------------------------------
+  # 4.5 Dataset selection
+  # ----------------------------------------
+  
+  observeEvent(input$tbl_toc_rows_selected, {
+    
+    rows <- input$tbl_toc_rows_selected
+    df <- search_df()
+    
+    if (length(rows) == 1 && nrow(df) >= rows) {
+      
+      rv$dataset_id <- df$code[rows]
+      rv$toc_start  <- df$dataStart[rows]
+      rv$toc_end    <- df$dataEnd[rows]
+      
+      # Reset structure & query state
+      rv$dsd <- NULL
+      rv$dim_filters <- list()
+      rv$base_url <- NULL
+      rv$final_url <- NULL
+      
+    } else {
+      
+      rv$dataset_id <- NULL
+      rv$toc_start  <- NULL
+      rv$toc_end    <- NULL
+      rv$dsd <- NULL
+      rv$dim_filters <- list()
+      rv$base_url <- NULL
+      rv$final_url <- NULL
+    }
+  })
+  
+  
+  # ----------------------------------------
+  # 4.6 Selected dataset UI
+  # ----------------------------------------
+  
+  output$selected_dataset_ui <- renderUI({
+    
+    if (is.null(rv$dataset_id)) {
+      span(style = "color:red;", "No dataset selected")
+    } else {
+      tagList(
+        strong("Selected dataset ID: "),
+        code(rv$dataset_id),
+        tags$br(),
+        tags$small(paste("TOC period:", rv$toc_start, "→", rv$toc_end))
+      )
+    }
+  })
+  
+  # ----------------------------------------
+  # 4.7 Reset logic
+  # ----------------------------------------
+  
+  observeEvent(input$btn_clear_all, {
+    
+    # 1) Reset state
+    rv$dataset_id <- NULL
+    rv$toc_start  <- NULL
+    rv$toc_end    <- NULL
+    rv$dsd        <- NULL
+    rv$dim_filters <- list()
+    rv$base_url   <- NULL
+    rv$final_url  <- NULL
+    
+    # 2) Reset UI inputs
+    updateTextInput(session, "search", value = "")
+    updateTextInput(session, "txt_final_url", value = "")
+    
+    # 3) Clear DT selection + DT internal search + table contents
+    proxy <- DT::dataTableProxy("tbl_toc")
+    DT::selectRows(proxy, NULL)
+    DT::clearSearch(proxy)
+    DT::replaceData(proxy, data.frame(), resetPaging = TRUE)
+    search_df(data.frame())
+    
+    # 4) Clear preview
+    preview_df(NULL)
+    output$txt_data_status <- renderText("")
+    
+    showNotification("Reset: ready for a new search.", type = "message")
+  })
+  
+  # ----------------------------------------
+  # 4.8 Load DSD (Structure)
+  # ----------------------------------------
+  
+  observeEvent(input$btn_load_dsd, {
+    
+    req(rv$dataset_id)
+    
+    withProgress(message = "Loading dataset structure (DSD)…", value = 0, {
+      
+      incProgress(0.4, detail = "Requesting DSD…")
+      
+      dsd_dt <- tryCatch(
+        get_eurostat_dsd(rv$dataset_id, lang = "en"),
+        error = function(e) {
+          showNotification(
+            paste("Failed to load DSD:", e$message),
+            type = "error"
+          )
+          return(NULL)
+        }
+      )
+      
+      if (is.null(dsd_dt) || nrow(dsd_dt) == 0) {
+        showNotification("DSD returned empty result.", type = "warning")
         return()
       }
       
+      incProgress(0.8, detail = "Storing structure…")
+      
       rv$dsd <- dsd_dt
-      rv$dim_selected <- NULL
       
-      # Reset query builder state on new DSD load
-      rv$dim_filters <- NULL
-      rv$time_from <- NULL
-      rv$time_to <- NULL
-      rv$base_url <- NULL
-      rv$final_url <- NULL
-      rv$preview_df <- NULL
-      updateTextInput(session, "txt_final_url", value = "")
-      
-      showNotification("DSD loaded.", type = "message")
-      
-    }, error = function(e) {
-      showNotification(paste0("Failed to load DSD: ", e$message), type = "error")
-      rv$dsd <- NULL
-      rv$dim_selected <- NULL
-      rv$dim_filters <- NULL
-      rv$time_from <- NULL
-      rv$time_to <- NULL
-      rv$base_url <- NULL
-      rv$final_url <- NULL
-      rv$preview_df <- NULL
-      updateTextInput(session, "txt_final_url", value = "")
+      incProgress(1)
     })
   })
   
-  output$dim_selection_ui <- renderUI({
-    if (is.null(rv$dsd)) {
-      span(style = "color: red;", "Structure not loaded")
-    } else {
-      dims <- unique(rv$dsd$concept)
-      selectInput("sel_dim", "Select Dimension", choices = dims, selected = rv$dim_selected)
-    }
+  
+  
+  # ----------------------------------------
+  # 4.9 DSD dimensions overview container (View)
+  # ----------------------------------------
+  # Purpose:
+  # - Show a compact "metadata box" with DSD dimension order + size.
+  # - This block only defines the layout and places DTOutput().
+  # - The table itself is rendered in 4.10.
+  
+  output$dims_overview_ui <- renderUI({
+    req(rv$dsd)
+
+    tags$div(
+      style = "margin-top: 10px;",
+      tags$strong("Available dimensions (DSD order):"),
+      tags$div(
+        style = "text-align: left;",
+        tags$div(
+          style = paste(
+            "margin-top: 8px;",
+            "margin-bottom: 18px;",
+            "display: inline-block;",
+            "padding: 10px 12px;",
+            "border: 1px solid #e6e6e6;",
+            "border-radius: 6px;",
+            "background: #fafafa;"
+          ),
+          DT::DTOutput("tbl_dims_overview")   # <-- HÄR
+        )
+      )
+    )
+
+  })
+
+  
+  
+  # ----------------------------------------
+  # 4.10 DSD dimensions overview table (View)
+  # ----------------------------------------
+  # Purpose:
+  # - Render the overview DT with:
+  #   - DSD order (Position)
+  #   - Dimension name
+  #   - Number of categories (codes) per dimension
+  # - This is a read-only metadata table (no paging/search/sorting).
+  
+  output$tbl_dims_overview <- DT::renderDT({
+    req(rv$dsd)
+    
+    dims <- unique(rv$dsd$concept)
+    
+    dim_df <- data.frame(
+      Position   = as.character(seq_along(dims)),
+      Dimension  = dims,
+      Categories = as.character(sapply(dims, function(d) sum(rv$dsd$concept == d))),
+      stringsAsFactors = FALSE
+    )
+    
+    DT::datatable(
+      dim_df,
+      class = "compact",
+      selection = "single",
+      options = list(
+        dom = "t",
+        paging = FALSE,
+        ordering = FALSE,
+        autoWidth = FALSE,
+        columnDefs = list(
+          list(width = "45px", targets = 0),
+          list(width = "160px", targets = 1),
+          list(width = "70px", targets = 2),
+          list(className = "dt-left", targets = "_all")
+        )
+      ),
+      rownames = FALSE
+    )
+  }, server = TRUE)
+  
+  # ----------------------------------------
+  # 4.11 Overview click -> select dimension (Controller)
+  # ----------------------------------------
+  # Purpose:
+  # - When the user clicks a row in the overview table,
+  #   update the dimension dropdown ("sel_dim") to match.
+  # - This couples the overview and the code list for smoother UX.
+  
+  
+  observeEvent(input$tbl_dims_overview_rows_selected, {
+    req(rv$dsd)
+    
+    i <- input$tbl_dims_overview_rows_selected
+    if (length(i) != 1) return()
+    
+    dims <- unique(rv$dsd$concept)
+    selected_dim <- dims[i]
+    
+    updateSelectInput(session, "sel_dim", selected = selected_dim)
   })
   
-  observeEvent(input$sel_dim, {
-    rv$dim_selected <- input$sel_dim
+  
+  # ----------------------------------------
+  # 4.12 Dimension selector (View)
+  # ----------------------------------------
+  # Purpose:
+  # - Provide a dropdown for choosing a dimension (DSD order).
+  # - Selection drives the code table in 4.13.
+  # - No state changes here; pure UI.
+  
+  output$dim_selection_ui <- renderUI({
+    req(rv$dsd)
+    
+    dims <- unique(rv$dsd$concept)
+    
+    selectInput(
+      inputId = "sel_dim",
+      label   = "Select dimension:",
+      choices = dims,
+      selected = NULL
+    )
   })
+  
+  # ----------------------------------------
+  # 4.13 Codes for selected dimension (View)
+  # ----------------------------------------
+  # Purpose:
+  # - Display code + label list for the selected dimension.
+  # - Useful for understanding what values can be used in filters / SDMX keys.
   
   output$tbl_codes <- renderDT({
-    if (is.null(rv$dsd)) {
-      return(datatable(data.frame(Message = "Structure not loaded"), options = list(dom = 't'), rownames = FALSE))
-    }
-    if (is.null(rv$dim_selected)) {
-      return(datatable(data.frame(Message = "No dimension selected"), options = list(dom = 't'), rownames = FALSE))
-    }
+    req(rv$dsd)
+    req(input$sel_dim)
     
-    dim_table <- rv$dsd[rv$dsd$concept == rv$dim_selected, c("code", "name")]
+    dim_table <- rv$dsd[rv$dsd$concept == input$sel_dim, c("code", "name")]
     dim_table <- dim_table[order(dim_table$code), , drop = FALSE]
     
     if (nrow(dim_table) == 0) {
-      return(datatable(data.frame(Message = "No codes found for selected dimension"), options = list(dom = 't'), rownames = FALSE))
+      return(datatable(
+        data.frame(Message = "No codes found for selected dimension"),
+        options = list(dom = "t"),
+        rownames = FALSE
+      ))
     }
     
-    datatable(dim_table, options = list(pageLength = 10, scrollX = TRUE), colnames = c("Code", "Label"))
+    datatable(
+      dim_table,
+      options = list(pageLength = 10, scrollX = TRUE),
+      rownames = FALSE,
+      colnames = c("Code", "Label")
+    )
   }, server = TRUE)
   
-  output$message_ui <- renderUI({
-    if (is.null(rv$dataset_id)) {
-      span(style = "color: red;", "Please select a dataset from search results.")
-    } else if (is.null(rv$dsd)) {
-      span(style = "color: red;", "Structure not loaded. Click 'Load Structure'.")
-    } else if (is.null(rv$dim_selected)) {
-      span(style = "color: gray;", "Select a dimension to see codes and labels.")
-    } else {
-      NULL
-    }
-  })
-  
-  # ---------------------------
-  # SDMX Query Builder UI
-  # ---------------------------
-  
-  # Render filter ui: one multi-select per dimension, plus time filter
-  output$query_builder_ui <- renderUI({
-    req(rv$dsd, rv$dataset_id)
+  # ----------------------------------------
+  # 4.14 Dimension filters UI (View)
+  # ----------------------------------------
+  # Purpose:
+  # - Render one filter input per DSD dimension, in DSD order.
+  # - Empty selection means "all values" for that dimension.
+  # - freq is single-select and auto-defaulted.
+  # - geo is multi-select and must be chosen manually.
+  output$filters_ui <- renderUI({
+    req(rv$dsd)
     
-    dims <- unique(rv$dsd$concept)
-    # For each dim, get all codes sorted
-    dim_choices <- lapply(dims, function(d) {
-      codes <- sort(unique(rv$dsd$code[rv$dsd$concept == d]))
-      codes
-    })
-    names(dim_choices) <- dims
+    dims <- unique(rv$dsd$concept)  # IMPORTANT: keep DSD order
     
-    # For each dim get current selected filters (if any)
-    current_filters <- rv$dim_filters
-    if (is.null(current_filters)) {
-      current_filters <- vector("list", length(dims))
-      names(current_filters) <- dims
-    }
-    
-    ui_list <- lapply(dims, function(d) {
-      selectizeInput(
-        inputId = paste0("filter_", d),
-        label = paste0("Filter Dimension: ", d),
-        choices = dim_choices[[d]],
-        selected = current_filters[[d]],
-        multiple = TRUE,
-        options = list(plugins = list('remove_button'), maxItems = NULL)
-      )
-    })
-    
-    # Time filter: text inputs FROM and TO (both optional)
-    # We'll infer time dimension name, or fallback to "time"
-    time_dim_candidates <- grep("^time$", dims, ignore.case = TRUE, value = TRUE)
-    time_dim <- if (length(time_dim_candidates) == 1) time_dim_candidates else NULL
-    
-    if (!is.null(time_dim)) {
-      ui_list <- c(
-        ui_list,
-        tagList(
-          tags$hr(),
-          tags$strong("Optional time filter (FROM:TO)"),
-          fluidRow(
-            column(6,
-                   textInput("time_from", paste0("FROM (", time_dim, ")"), value = rv$time_from)
-            ),
-            column(6,
-                   textInput("time_to", paste0("TO (", time_dim, ")"), value = rv$time_to)
-            )
+    tagList(
+      tags$div(
+        style = "margin-bottom:8px; color:#666; font-size:0.85em;",
+        "Leave empty = all values"
+      ),
+      
+      lapply(dims, function(d) {
+        
+        choices <- unique(rv$dsd$code[rv$dsd$concept == d])
+        
+        # --- Default selection logic ---
+        if (d == "freq") {
+          default_sel <- if ("Q" %in% choices) "Q" else choices[1]
+        } else {
+          default_sel <- NULL
+        }
+        
+        label_txt <- if (d == "freq") {
+          "freq (required: choose 1)"
+        } else if (d == "geo") {
+          "geo (required: choose ≥1)"
+        } else {
+          paste0("Filter: ", d)
+        }
+        
+        is_single <- identical(d, "freq")
+        
+        selectizeInput(
+          inputId  = paste0("flt_", d),
+          label    = label_txt,
+          choices  = choices,
+          selected = default_sel,
+          multiple = !is_single,
+          options  = list(
+            plugins  = if (is_single) NULL else list("remove_button"),
+            maxItems = if (is_single) 1 else NULL
           )
         )
-      )
-    }
-    
-    do.call(tagList, ui_list)
+      })
+    )
   })
   
-  # Observe filter inputs to update reactive rv$dim_filters
+  
+  
+  # ----------------------------------------
+  # 4.15 Collect selected filters into rv$dim_filters (Controller)
+  # ----------------------------------------
+  # Purpose:
+  # - Read all flt_* inputs and store them as a named list.
+  # - Used later when building the SDMX key.
   observe({
-    req(rv$dsd, rv$dataset_id)
+    req(rv$dsd)
+    
     dims <- unique(rv$dsd$concept)
-    filters <- list()
+    
+    filters <- setNames(vector("list", length(dims)), dims)
+    
     for (d in dims) {
-      flt <- input[[paste0("filter_", d)]]
-      if (!is.null(flt) && length(flt) > 0 && nzchar(flt[1])) {
-        filters[[d]] <- as.character(flt)
+      x <- input[[paste0("flt_", d)]]
+      if (!is.null(x) && length(x) > 0) {
+        filters[[d]] <- as.character(x)
       } else {
         filters[[d]] <- character(0)
       }
     }
+    
     rv$dim_filters <- filters
+  })
+  
+  # ----------------------------------------
+  # 4.16 Generate query URL (Controller)
+  # ----------------------------------------
+  # Purpose:
+  # - Build SDMX 2.1 data URL from current selections:
+  #   - dataset_id
+  #   - dimension filters (SDMX key)
+  #   - startPeriod/endPeriod from TOC (app rule)
+  # - If no filters are selected, key segments remain empty => "all".
+  
+  observeEvent(input$btn_generate_query, {
+    req(rv$dataset_id, rv$dsd, rv$toc_end)
     
-    # Time filter
-    time_dim_candidates <- grep("^time$", dims, ignore.case = TRUE, value = TRUE)
-    time_dim <- if (length(time_dim_candidates) == 1) time_dim_candidates else NULL
-    
-    if (!is.null(time_dim)) {
-      rv$time_from <- if (!is.null(input$time_from)) input$time_from else NULL
-      rv$time_to <- if (!is.null(input$time_to)) input$time_to else NULL
-    } else {
-      rv$time_from <- NULL
-      rv$time_to <- NULL
-    }
-  })
-  
-  # Helper: Build base URL (unfiltered)
-  build_base_url <- reactive({
-    req(rv$dataset_id)
-    # Compose base SDMX 2.1 REST data URL for Eurostat
-    # Example:
-    # https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/{flowRef}
-    paste0("https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/", rv$dataset_id)
-  })
-  
-  # Button: Generate base query (unfiltered)
-  observeEvent(input$btn_generate_base_query, {
-    req(rv$dataset_id)
-    rv$base_url <- build_base_url()
-    # Unfiltered query for SDMX-CSV format
-    base_url_w_format <- paste0(rv$base_url, "?format=SDMX-CSV")
-    rv$final_url <- base_url_w_format
-    updateTextInput(session, "txt_final_url", value = rv$final_url)
-  })
-  
-  # Build full URL with filters and time, format=SDMX-CSV default
-  build_full_url <- reactive({
-    req(rv$base_url)
+    # dims <- unique(rv$dsd$concept)
+    # 
+    # # --- Require freq (if dimension exists) ---
+    # if ("freq" %in% dims) {
+    #   sel_freq <- rv$dim_filters[["freq"]]
+    #   if (is.null(sel_freq) || length(sel_freq) != 1) {
+    #     showNotification("Please select exactly one FREQ before generating the query.", type = "warning")
+    #     return()
+    #   }
+    #   freq_code <- sel_freq[[1]]
+    # } else {
+    #   # If dataset has no freq dimension, fall back to TOC end as-is
+    #   freq_code <- NULL
+    # }
+    # Identify dimension names as they appear in the DSD
     dims <- unique(rv$dsd$concept)
+    freq_dim <- get_freq_dim(dims)  # should return "freq" or NULL
+    geo_dim  <- get_geo_dim(dims)   # should return "geo"  or NULL
     
-    # Build SDMX key for dimensions, per order
-    # Each dimension segment:
-    # - if no filters: ""
-    # - if filters: filter values separated by +
-    # If no filters, empty string will be treated as default "all codes"
-    segments <- character(length(dims))
-    names(segments) <- dims
+    filters <- rv$dim_filters
     
-    for (d in dims) {
+    # --- Require FREQ (choose exactly 1) ---
+    if (!is.null(freq_dim)) {
+      sel_freq <- filters[[freq_dim]]
+      if (is.null(sel_freq) || length(sel_freq) < 1) {
+        showNotification("Please choose a value for freq before generating the URL.", type = "warning")
+        return()
+      }
+      if (length(sel_freq) > 1) {
+        showNotification("Please choose exactly 1 value for freq.", type = "warning")
+        return()
+      }
+      freq_code <- sel_freq[1]
+    } else {
+      freq_code <- NULL
+    }
+    
+    # --- Require GEO (choose >= 1) ---
+    if (!is.null(geo_dim)) {
+      sel_geo <- filters[[geo_dim]]
+      if (is.null(sel_geo) || length(sel_geo) < 1) {
+        showNotification("Please choose at least 1 geo before generating the URL.", type = "warning")
+        return()
+      }
+    }
+    
+    # --- Build SDMX key segments (DSD order) ---
+    segments <- vapply(dims, function(d) {
       vals <- rv$dim_filters[[d]]
-      if (length(vals) == 0) {
-        # empty means all codes for that dimension -> empty string segment
-        segments[d] <- ""
-      } else {
-        # join selected codes by '+'
-        segments[d] <- paste0(vals, collapse = "+")
-      }
-    }
+      if (is.null(vals) || length(vals) == 0) "" else paste(vals, collapse = "+")
+    }, character(1))
     
-    # Handle time dimension filtering if present
-    time_dim_candidates <- grep("^time$", dims, ignore.case = TRUE, value = TRUE)
-    time_dim <- if (length(time_dim_candidates) == 1) time_dim_candidates else NULL
-    
-    # If time dimension present and time_from or time_to defined, filter time codes accordingly:
-    if (!is.null(time_dim)) {
-      time_vals <- rv$dim_filters[[time_dim]]
-      if (!is.null(rv$time_from) && nzchar(rv$time_from)) {
-        time_from <- rv$time_from
-      } else {
-        time_from <- NULL
-      }
-      if (!is.null(rv$time_to) && nzchar(rv$time_to)) {
-        time_to <- rv$time_to
-      } else {
-        time_to <- NULL
-      }
-      
-      if (!is.null(time_from) || !is.null(time_to)) {
-        # Get all time codes in DSD for time_dim, sorted
-        all_time_codes <- sort(unique(rv$dsd$code[rv$dsd$concept == time_dim]))
-        # Subset by FROM/TO bounds (string compare)
-        # If time_from NULL => min, if time_to NULL => max
-        min_time <- if (!is.null(time_from) && nzchar(time_from)) time_from else all_time_codes[1]
-        max_time <- if (!is.null(time_to) && nzchar(time_to)) time_to else all_time_codes[length(all_time_codes)]
-        
-        # Filter time codes within [min_time, max_time]
-        filtered_times <- all_time_codes[all_time_codes >= min_time & all_time_codes <= max_time]
-        
-        # If user selected specific time codes too, intersect with filtered_times
-        if (length(time_vals) > 0) {
-          filtered_times <- intersect(filtered_times, time_vals)
-        }
-        if (length(filtered_times) == 0) {
-          # fallback to empty (means all, but here user filtered empty time set)
-          segments[time_dim] <- ""
-        } else {
-          segments[time_dim] <- paste(filtered_times, collapse = "+")
-        }
-      }
-    }
-    
-    # Compose SDMX key string: segments separated by '.'
     key_string <- paste(segments, collapse = ".")
     
-    # Build final URL
-    # Format default to SDMX-CSV to meet requirement
-    url <- paste0(rv$base_url, "/", key_string, "?format=SDMX-CSV")
-    url
-  })
-  
-  # Auto-update final_url when filters or base_url change
-  observe({
-    req(rv$base_url)
-    full_url <- build_full_url()
-    rv$final_url <- full_url
-    updateTextInput(session, "txt_final_url", value = full_url)
-  })
-  
-  # Copy query to clipboard
-  # observeEvent(input$btn_copy_query, {
-  #   req(rv$final_url)
-  #   session$sendCustomMessage("copyToClipboard", rv$final_url)
-  # })
-  observeEvent(input$btn_copy_query, {
-    req(rv$final_url)
+    base_url <- paste0(
+      "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/",
+      rv$dataset_id
+    )
     
+    # --- Time rule: single latest period derived from TOC end + freq ---
+    # latest_period <- if (!is.null(freq_code)) {
+    #   normalize_toc_end_for_freq(rv$toc_end, freq_code)
+    # } else {
+    #   rv$toc_end
+    # }
+    # 
+    params <- c("format=SDMX-CSV")
+    # if (!is.null(latest_period) && nzchar(latest_period)) {
+    #   params <- c(params, paste0("startPeriod=", latest_period),
+    #               paste0("endPeriod=", latest_period))
+    # }
+    latest_period <- normalize_toc_end_for_freq(rv$toc_end, freq_code)
+    
+    # fallback chain without API calls
+    if (is.null(latest_period) || !nzchar(latest_period)) latest_period <- rv$toc_end
+    if (is.null(latest_period) || !nzchar(latest_period)) latest_period <- rv$toc_start
+    
+    if (!is.null(latest_period) && nzchar(latest_period)) {
+      params <- c(params, paste0("startPeriod=", latest_period))
+      params <- c(params, paste0("endPeriod=", latest_period))
+    }
+    
+    final_url <- paste0(base_url, "/", key_string, "?", paste(params, collapse = "&"))
+    
+    rv$base_url  <- base_url
+    rv$final_url <- final_url
+    updateTextInput(session, "txt_final_url", value = final_url)
+    
+    showNotification(paste0("Query generated (", latest_period, ")."), type = "message")
+  })
+  
+  # ----------------------------------------
+  # 4.17 Estimate max size (no API calls)
+  # ----------------------------------------
+  output$txt_estimate <- renderText({
+    req(rv$dsd)
+    
+    dims <- unique(rv$dsd$concept)
+    
+    n_used <- vapply(dims, function(d) {
+      sel <- rv$dim_filters[[d]]
+      if (!is.null(sel) && length(sel) > 0) {
+        length(sel)
+      } else {
+        sum(rv$dsd$concept == d)
+      }
+    }, numeric(1))
+    
+    max_rows <- prod(n_used)
+    
+    formatted_max <- format(
+      max_rows,
+      scientific = FALSE,
+      big.mark = " "
+    )
+    
+    breakdown <- paste0(dims, "=", n_used, collapse = " × ")
+    
+    paste0(
+      "Max rows (cartesian upper bound): ", formatted_max, "\n",
+      breakdown, "\n",
+      "Note: actual rows are usually lower (not all combinations exist)."
+    )
+  })
+  
+  # ----------------------------------------
+  # 4.17 Copy query to clipboard
+  # ----------------------------------------
+  observeEvent(input$btn_copy_query, {
+    url <- isolate(input$txt_final_url)
+    if (is.null(url) || !nzchar(url)) {
+      showNotification("No URL to copy yet.", type = "warning")
+      return()
+    }
+    
+    # Call JS helper in www/clipboard.js
     session$sendCustomMessage("copyToClipboard", list(
-      text = rv$final_url,
-      inputId = "txt_final_url"   # ID:t på textInput där URL:en står
+      text = url,
+      inputId = "txt_final_url"
     ))
     
-    showNotification("Copied (or attempted). If it failed, click in the URL field and press Ctrl+C.", type = "message")
+    showNotification("Copied (or attempted). If it failed: click the URL field and press Ctrl+C.", type = "message")
   })
   
-  preview_df <- reactiveVal(NULL)
+  # ----------------------------------------
+  # 4.18 Max rows estimate (cartesian upper bound)
+  # ----------------------------------------
+  max_rows_est <- reactive({
+    req(rv$dsd)
+    
+    dims <- unique(rv$dsd$concept)
+    
+    n_used <- vapply(dims, function(d) {
+      sel <- rv$dim_filters[[d]]
+      if (!is.null(sel) && length(sel) > 0) length(sel) else sum(rv$dsd$concept == d)
+    }, numeric(1))
+    
+    prod(n_used)
+  })
   
+  MAX_PREVIEW_ROWS  <- 2000   # preview blockeras över detta
+  MAX_DOWNLOAD_ROWS <- 1000000  # download blockeras över detta (valfritt)
+  
+  # ----------------------------------------
+  # 4.19 Guard query size pre view
+  # ----------------------------------------
+  guard_query_size <- function(limit, label = "this action") {
+    est <- max_rows_est()
+    if (is.null(est) || !is.finite(est)) return(TRUE)
+    
+    if (est > limit) {
+      showNotification(
+        paste0(
+          "Blocked ", label, ": estimated max rows = ", format(est, scientific = FALSE, big.mark = " "),
+          " (limit = ", format(limit, scientific = FALSE, big.mark = " "), ").\n",
+          "Add filters (especially geo / other dims) to reduce the query."
+        ),
+        type = "error", duration = 10
+      )
+      return(FALSE)
+    }
+    TRUE
+  }
+  
+  # ----------------------------------------
+  # 4.20 Pre view Data
+  # ----------------------------------------
+  # observeEvent(input$btn_preview_data, {
+  #   req(rv$final_url)
+  #   
+  #   # Guardrail
+  #   if (!guard_query_size(MAX_PREVIEW_ROWS, "preview")) return()
+  #   
+  #   output$txt_data_status <- renderText("Fetching preview…")
+  #   
+  #   # Request a small sample
+  #   preview_n <- 50
+  #   sep <- if (grepl("\\?", rv$final_url)) "&" else "?"
+  #   preview_url <- paste0(rv$final_url, sep, "firstNObservations=", preview_n)
+  #   
+  #   tryCatch({
+  #     withProgress(message = "Downloading preview…", value = 0, {
+  #       incProgress(0.3, detail = "Requesting SDMX-CSV…")
+  #       lines <- fetch_sdmx_csv(preview_url, max_lines = preview_n + 5)
+  #       incProgress(0.7, detail = "Parsing…")
+  #       df <- parse_csv_lines(lines)
+  #       incProgress(1, detail = "Done")
+  #       preview_df(df)
+  #     })
+  #     
+  #     output$txt_data_status <- renderText(
+  #       sprintf("Preview loaded: %d rows, %d columns", nrow(preview_df()), ncol(preview_df()))
+  #     )
+  #   }, error = function(e) {
+  #     preview_df(NULL)
+  #     output$txt_data_status <- renderText(paste("Preview failed:", e$message))
+  #     showNotification(paste0("Preview failed: ", e$message), type = "error")
+  #   })
+  # })
+  # ----------------------------------------
+  # Preview (first rows) with annual fallback
+  # ----------------------------------------
+  # observeEvent(input$btn_preview_data, {
+  #   req(rv$final_url)
+  #   
+  #   # Guardrail: block preview if estimated max is too large
+  #   if (exists("guard_query_size", mode = "function")) {
+  #     if (!guard_query_size(MAX_PREVIEW_ROWS, "preview")) return()
+  #   }
+  #   
+  #   output$txt_data_status <- renderText("Fetching preview…")
+  #   
+  #   preview_n <- 50
+  #   
+  #   # Build preview URL (small sample)
+  #   sep <- if (grepl("\\?", rv$final_url)) "&" else "?"
+  #   preview_url <- paste0(rv$final_url, sep, "firstNObservations=", preview_n)
+  #   
+  #   tryCatch({
+  #     withProgress(message = "Downloading preview…", value = 0, {
+  #       
+  #       incProgress(0.25, detail = "Requesting SDMX-CSV…")
+  #       lines <- fetch_sdmx_csv(preview_url, max_lines = preview_n + 5)
+  #       
+  #       incProgress(0.55, detail = "Parsing…")
+  #       df <- parse_csv_lines(lines)
+  #       
+  #       # -----------------------------
+  #       # Annual fallback if 0 rows
+  #       # -----------------------------
+  #       if (nrow(df) == 0) {
+  #         incProgress(0.70, detail = "No rows. Trying fallback years…")
+  #         
+  #         # Extract current period from URL
+  #         current_period <- sub(".*[?&]startPeriod=([^&]+).*", "\\1", rv$final_url)
+  #         
+  #         # Try up to N previous years
+  #         tried <- 0L
+  #         max_tries <- 10L
+  #         
+  #         repeat {
+  #           if (nrow(df) > 0 || tried >= max_tries) break
+  #           
+  #           tried <- tried + 1L
+  #           # prev <- prev_period_A(current_period)
+  #           prev <- prev_period(freq_code, current_period)
+  #           if (is.null(prev) || !nzchar(prev)) break
+  #           
+  #           # Replace start/end in preview_url
+  #           preview_url2 <- sub("startPeriod=[^&]+", paste0("startPeriod=", prev), preview_url)
+  #           preview_url2 <- sub("endPeriod=[^&]+",   paste0("endPeriod=", prev),   preview_url2)
+  #           
+  #           # Try again
+  #           lines2 <- fetch_sdmx_csv(preview_url2, max_lines = preview_n + 5)
+  #           df2 <- parse_csv_lines(lines2)
+  #           
+  #           if (nrow(df2) > 0) {
+  #             df <- df2
+  #             current_period <- prev
+  #             
+  #             # Update final URL too (so download uses the working period)
+  #             new_final <- sub("startPeriod=[^&]+", paste0("startPeriod=", current_period), rv$final_url)
+  #             new_final <- sub("endPeriod=[^&]+",   paste0("endPeriod=", current_period),   new_final)
+  #             
+  #             rv$final_url <- new_final
+  #             updateTextInput(session, "txt_final_url", value = new_final)
+  #             
+  #             showNotification(
+  #               paste0("No data for latest period. Fell back to ", current_period, "."),
+  #               type = "warning", duration = 6
+  #             )
+  #             break
+  #           }
+  #           
+  #           # keep stepping back
+  #           current_period <- prev
+  #         }
+  #       }
+  #       
+  #       incProgress(0.95, detail = "Finalizing…")
+  #       preview_df(df)
+  #       incProgress(1, detail = "Done")
+  #     })
+  #     
+  #     output$txt_data_status <- renderText(
+  #       sprintf("Preview loaded: %d rows, %d columns", nrow(preview_df()), ncol(preview_df()))
+  #     )
+  #     
+  #   }, error = function(e) {
+  #     preview_df(NULL)
+  #     output$txt_data_status <- renderText(paste("Preview failed:", e$message))
+  #     showNotification(paste0("Preview failed: ", e$message), type = "error")
+  #   })
+  # })
+  
+
   observeEvent(input$btn_preview_data, {
     req(rv$final_url)
     
-    # Safety: ensure SDMX-CSV
-    url <- rv$final_url
-    if (!grepl("format=SDMX-CSV", url, fixed = TRUE)) {
-      showNotification("Final URL must include format=SDMX-CSV.", type = "error")
-      return()
+    # Guardrail: block preview if estimated max is too large
+    if (exists("guard_query_size", mode = "function")) {
+      if (!guard_query_size(MAX_PREVIEW_ROWS, "preview")) return()
     }
     
     output$txt_data_status <- renderText("Fetching preview…")
     
+    preview_n  <- 50
+    max_tries  <- 10L
+    
+    # Build preview URL (small sample)
+    sep <- if (grepl("\\?", rv$final_url)) "&" else "?"
+    preview_url <- paste0(rv$final_url, sep, "firstNObservations=", preview_n)
+    
+    # --- determine freq_code once (needed for A/Q/M fallback) ---
+    freq_code <- NULL
+    if (!is.null(rv$dsd) && length(rv$dim_filters) > 0) {
+      dims <- unique(rv$dsd$concept)
+      freq_dim <- get_freq_dim(dims)  # your helper (returns "freq" or NULL)
+      if (!is.null(freq_dim)) {
+        sel <- rv$dim_filters[[freq_dim]]
+        if (!is.null(sel) && length(sel) >= 1) {
+          freq_code <- sel[1]  # assume single selection for freq
+        }
+      }
+    }
+    
     tryCatch({
       withProgress(message = "Downloading preview…", value = 0, {
-        incProgress(0.3, detail = "Requesting SDMX-CSV…")
-        lines <- fetch_sdmx_csv(url, max_lines = 250)  # header + ~250 lines
-        incProgress(0.7, detail = "Parsing…")
+        
+        incProgress(0.25, detail = "Requesting SDMX-CSV…")
+        lines <- fetch_sdmx_csv(preview_url, max_lines = preview_n + 5)
+        
+        incProgress(0.55, detail = "Parsing…")
         df <- parse_csv_lines(lines)
-        incProgress(1, detail = "Done")
+        
+        # -------------------------------------------------
+        # Fallback if 0 rows: step back by freq (A/Q/M)
+        # -------------------------------------------------
+        if (nrow(df) == 0) {
+          incProgress(0.70, detail = "No rows. Trying fallback periods…")
+          
+          # Extract current period from URL (we use startPeriod as the anchor)
+          current_period <- sub(".*[?&]startPeriod=([^&]+).*", "\\1", rv$final_url)
+          
+          tried <- 0L
+          
+          repeat {
+            if (nrow(df) > 0 || tried >= max_tries) break
+            
+            tried <- tried + 1L
+            
+            prev <- prev_period(freq_code, current_period)  # supports A/Q/M
+            if (is.null(prev) || !nzchar(prev)) break
+            
+            # Replace start/end in preview_url
+            preview_url2 <- sub("startPeriod=[^&]+", paste0("startPeriod=", prev), preview_url)
+            preview_url2 <- sub("endPeriod=[^&]+",   paste0("endPeriod=", prev),   preview_url2)
+            
+            # Try again
+            lines2 <- fetch_sdmx_csv(preview_url2, max_lines = preview_n + 5)
+            df2 <- parse_csv_lines(lines2)
+            
+            if (nrow(df2) > 0) {
+              df <- df2
+              current_period <- prev
+              
+              # Update final URL too (so download uses the working period)
+              new_final <- sub("startPeriod=[^&]+", paste0("startPeriod=", current_period), rv$final_url)
+              new_final <- sub("endPeriod=[^&]+",   paste0("endPeriod=", current_period),   new_final)
+              
+              rv$final_url <- new_final
+              updateTextInput(session, "txt_final_url", value = new_final)
+              
+              showNotification(
+                paste0("No data for latest period. Fell back to ", current_period, "."),
+                type = "warning", duration = 6
+              )
+              break
+            }
+            
+            # keep stepping back
+            current_period <- prev
+          }
+        }
+        
+        incProgress(0.95, detail = "Finalizing…")
         preview_df(df)
+        incProgress(1, detail = "Done")
       })
-      output$txt_data_status <- renderText(sprintf("Preview loaded: %d rows, %d columns", nrow(preview_df()), ncol(preview_df())))
+      
+      output$txt_data_status <- renderText(
+        sprintf("Preview loaded: %d rows, %d columns", nrow(preview_df()), ncol(preview_df()))
+      )
+      
     }, error = function(e) {
       preview_df(NULL)
       output$txt_data_status <- renderText(paste("Preview failed:", e$message))
       showNotification(paste0("Preview failed: ", e$message), type = "error")
     })
   })
+  
+    
+  # ----------------------------------------
+  # 4.21 Render Pre view Data
+  # ----------------------------------------
   
   output$preview_ui <- renderUI({
     df <- preview_df()
@@ -673,53 +1067,26 @@ server <- function(input, output, session) {
     datatable(df, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE)
   }, server = TRUE)
   
-  # output$preview_ui <- renderUI({
-  #   if (is.null(rv$preview_df)) {
-  #     return(NULL)
-  #   }
-  #   tagList(
-  #     h4("Data Preview"),
-  #     DTOutput("tbl_preview")
-  #   )
-  # })
-  # 
-  # output$tbl_preview <- renderDT({
-  #   req(rv$preview_df)
-  #   datatable(rv$preview_df,
-  #             options = list(pageLength = 10, scrollX = TRUE),
-  #             rownames = FALSE)
-  # }, server = TRUE)
-  
-  # output$tbl_preview <- renderDT({
-  #   df <- preview_df()
-  #   if (is.null(df)) {
-  #     return(datatable(data.frame(Message = "No preview loaded yet."), options = list(dom = "t"), rownames = FALSE))
-  #   }
-  #   datatable(df, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE)
-  # }, server = TRUE)
-  
-
   
   output$btn_download_data <- downloadHandler(
     filename = function() {
-      id <- if (!is.null(rv$dataset_id)) rv$dataset_id else "eurostat"
+      id <- rv$dataset_id %||% "eurostat"
       paste0(id, "_sdmx.csv")
     },
     content = function(file) {
       req(rv$final_url)
-      url <- rv$final_url
-      if (!grepl("format=SDMX-CSV", url, fixed = TRUE)) {
-        stop("Final URL must include format=SDMX-CSV.")
+      
+      # Guardrail
+      if (!guard_query_size(MAX_DOWNLOAD_ROWS, "download")) {
+        stop("Download blocked due to estimated query size. Add more filters and try again.")
       }
-      # Direct download to the provided file path
-      utils::download.file(url, file, quiet = TRUE, mode = "wb")
+      
+      utils::download.file(rv$final_url, file, quiet = TRUE, mode = "wb")
     }
   )
   
-  observe({ cat("rv$preview_df is NULL? ", is.null(rv$preview_df), "\n") })
-  observe({ cat("preview_df() is NULL? ", is.null(preview_df()), "\n") })
+  
   
   
 }
-
 shinyApp(ui, server)
