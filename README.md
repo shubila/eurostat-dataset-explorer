@@ -53,10 +53,10 @@ SDMX Data URL
 Validated time period
 → Ensures the selected period actually contains data
 
-R Labels Helper Script
-→ Dynamically downloads codelists (TSV)
-→ Merges codes with labels
-→ No local files required
+**R Labels Helper Script**
+- Dynamically downloads codelists (TSV)
+- Merges codes with labels
+- No local files required
 ------------------------------------------------------------------------
 
 ## Project Structure
