@@ -207,18 +207,39 @@ server <- function(input, output, session) {
   # 4.2 Load TOC (once per session)
   # ----------------------------------------
   
+  # observe({
+  #   if (!is.null(rv$toc)) return()
+  #   
+  #   withProgress(message = "Loading Eurostat catalogue (TOC)…", value = 0, {
+  #     incProgress(0.3, detail = "Reading cache / downloading…")
+  #     df <- load_toc_once()
+  #     incProgress(0.9, detail = "Finalizing…")
+  #     rv$toc <- df
+  #     incProgress(1)
+  #   })
+  # })
   observe({
     if (!is.null(rv$toc)) return()
     
     withProgress(message = "Loading Eurostat catalogue (TOC)…", value = 0, {
+      
       incProgress(0.3, detail = "Reading cache / downloading…")
       df <- load_toc_once()
+      
+      incProgress(0.6, detail = "Filtering invalid TOC entries…")
+      
+      # Remove datasets with missing or empty dataEnd
+      df <- df[
+        !is.na(df$dataEnd) &
+          nzchar(trimws(df$dataEnd)),
+      ]
+      
       incProgress(0.9, detail = "Finalizing…")
       rv$toc <- df
+      
       incProgress(1)
     })
   })
-  
   
   
   # ----------------------------------------
